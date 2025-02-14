@@ -1,109 +1,77 @@
-#! /usr/bin/env python3
+#!/usr/bin/env python3
 
 import sys
+import subprocess
+import re
 import os
-from subprocess import run
-from hwrap_settings import REAL_HELM, BITNAMI_HOST, HARBOR_HOST
+from hwrap_settings import REAL_HELM, HARBOR_HOST
 
-BITNAMI_HOST = "https://charts.bitnami.com/bitnami"
+# Define repository substitutions
+SUBSTITUTION_HOSTS = {
+    "https://charts.bitnami.com/bitnami": "bitnami"
+}
 
-def get_handles():
-    """Retrieve Helm repository handles"""
-    cmd = f"{REAL_HELM} repo list"
-    data = run(cmd, capture_output=True, shell=True, text=True)
-    if data.returncode != 0:
-        return {}
-    lines = data.stdout.splitlines()[1:]  # Skip header
-    return {line.split()[0]: line.split()[1] for line in lines}
+def get_helm_repos():
+    """Retrieve Helm repositories as a dictionary {repo_name: repo_url}."""
+    try:
+        result = subprocess.run(
+            [REAL_HELM, "repo", "list"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except subprocess.CalledProcessError:
+        return {}  # Return empty if `helm repo list` fails
 
-def parse_repo_spec(repo_spec):
-    """Parses repository spec (e.g., 'google-test/tomcat') and extracts repository handle and chart name."""
-    parts = repo_spec.split("/")
-    return (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
+    repos = {}
+    for line in result.stdout.splitlines()[1:]:  # Skip header
+        parts = line.split()
+        if len(parts) >= 2:
+            repos[parts[0]] = parts[1]
+    return repos
 
-def uses_help(arg_list):
-    """Check if help is requested"""
-    return any(token in arg_list for token in ["-h", "--help", "help"])
+def is_local_chart(chart_ref):
+    """Checks if the given chart_ref is a local Helm chart."""
+    return os.path.isdir(chart_ref) and os.path.isfile(os.path.join(chart_ref, "Chart.yaml")) and os.path.isdir(os.path.join(chart_ref, "templates"))
 
-def build_help_cmd(arg_list):
-    """Ensure Helm help commands are properly handled"""
-    arg_list[0] = REAL_HELM
-    arg_list = [arg for arg in arg_list if arg not in ["-h", "--help", "help"]]
-    arg_list.append("--help")
-    return " ".join(arg_list)
+def find_chart_reference(args):
+    """Finds and returns the repo/chartname in the argument list."""
+    for arg in args:
+        if re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", arg):  # Match word/word pattern
+            return arg
+    return None
 
-def strip_flags(arg_list):
-    """Removes flags and their values from positional arguments but ensures they are not lost."""
-    stripped, flags = [], []
-    skip_next = False
+def modify_helm_command(args):
+    """Modifies the Helm command if a valid repo/chartname is found and it's not a local chart."""
+    if len(args) < 2:
+        return " ".join([REAL_HELM] + args[1:])  # Pass through unchanged if too few arguments
 
-    for i, item in enumerate(arg_list):
-        if skip_next:
-            skip_next = False
-            continue
+    chart_ref = find_chart_reference(args)
+    if not chart_ref:
+        return " ".join([REAL_HELM] + args[1:])  # No valid repo/chartname found
 
-        if item.startswith("-"):
-            if "=" in item:  # Handle flags with `=` (e.g., --version=1.1.1.1)
-                key, value = item.split("=", 1)  # Split into flag and value
-                flags.append(key)
-                flags.append(value)
-            else:
-                flags.append(item)
-                if i + 1 < len(arg_list) and not arg_list[i + 1].startswith("-"):
-                    flags.append(arg_list[i + 1])
-                    skip_next = True
-            continue  # Don't add the flag itself
+    # Check if the chart is a local Helm chart (Chart.yaml & templates/)
+    if is_local_chart(chart_ref):
+        return " ".join([REAL_HELM] + args[1:])  # If local, don't modify
 
-        stripped.append(item)
+    repo, chart = chart_ref.split("/")
+    repos = get_helm_repos()
 
-    return stripped, flags
+    if repo not in repos:
+        return " ".join([REAL_HELM] + args[1:])  # Repo not found, return unchanged
 
-def build_command(arg_list):
-    """Construct the correct Helm command, transforming chart references when necessary."""
-    
-    if len(arg_list) < 2:
-        return " ".join([REAL_HELM] + arg_list[1:])  # Pass through if too few arguments
+    repo_url = repos[repo]
+    if repo_url in SUBSTITUTION_HOSTS:
+        # Modify chart reference
+        new_chart_ref = f"oci://{HARBOR_HOST}/{SUBSTITUTION_HOSTS[repo_url]}/{chart}"
 
-    if uses_help(arg_list):
-        return build_help_cmd(arg_list)  # Handle help commands
+        # Replace in args
+        modified_args = [new_chart_ref if arg == chart_ref else arg for arg in args]
+        return " ".join([REAL_HELM] + modified_args[1:])  # Ensure `helm` is used
 
-    repos = get_handles()
-    cmd_parts = [REAL_HELM]
-    stripped_args, flags = strip_flags(arg_list)
+    return " ".join([REAL_HELM] + args[1:])  # Default case, no substitution
 
-    command = stripped_args[1]
-    if command not in ["install", "pull", "upgrade"]:
-        return " ".join([REAL_HELM] + arg_list[1:])  # Pass non-install, non-pull, and non-upgrade commands through unchanged
-
-    cmd_parts.append(command)
-
-    if command in ["install", "upgrade"]:
-        release_name = stripped_args[2] if len(stripped_args) > 2 else None
-        chart_name = stripped_args[3] if len(stripped_args) > 3 else None
-
-        if chart_name:
-            handle, repo = parse_repo_spec(chart_name)
-            if handle in repos and repos[handle] == BITNAMI_HOST:
-                chart_name = f"oci://{HARBOR_HOST}/bitnami/{repo}"
-
-        if release_name and chart_name:
-            cmd_parts.extend([release_name, chart_name])
-        elif chart_name:
-            cmd_parts.append(chart_name)
-
-    elif command == "pull":
-        chart_name = stripped_args[2] if len(stripped_args) > 2 else None
-
-        if chart_name:
-            handle, repo = parse_repo_spec(chart_name)
-            if handle in repos and repos[handle] == BITNAMI_HOST:
-                chart_name = f"oci://{HARBOR_HOST}/bitnami/{repo}"
-            cmd_parts.append(chart_name)
-
-    cmd_parts.extend(flags)  # Append flags at the end
-    return " ".join(cmd_parts)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     # Execute when the module is not initialized from an import statement.
     if 'DEBUG_WRAPPER' in os.environ:
         import debugpy
@@ -111,24 +79,5 @@ if __name__ == '__main__':
         print("Waiting for debugger attach", file=sys.stderr)
         debugpy.wait_for_client()
 
-    # input = [
-    #     "helm repo list",
-    #     "helm list",
-    #     "helm --help",
-    #     "helm install test1 somerepo/mariadb",
-    #     "helm install test2 bitnamy/mariadb",
-    #     "helm install test3 oci://torensys.com/bitnami/mariadb:10",
-    #     "helm repo myrepo https://charts.bitnami.com/bitnami",
-    # ]
-
-    # for test in input:
-    #     print();
-    #     args = test.split()
-    #     print("Running: ", test)
-    #     cmd, img = build_command(args)
-    #     print("CMD: ", cmd)
-
-    cmd = build_command(sys.argv)
-
-    # print("arglist: ", sys.argv)
-    print(cmd)
+    modified_cmd = modify_helm_command(sys.argv)
+    print(modified_cmd)  # Print the modified command for the wrapper script

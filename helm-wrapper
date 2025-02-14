@@ -17,15 +17,17 @@
 
 # Edit this to match the install location
 # as done in hwsettings.py:
-WRAPPER_INSTALL_DIR=.
+WRAPPER_INSTALL_DIR=/usr/local/sbin
 
-. $WRAPPER_INSTALL_DIR/hwrap_settings.py
+# Get the modified command from Python script
+MODIFIED_CMD=$(python3 "$WRAPPER_INSTALL_DIR/helm_wrap.py" "$@")
 
-
-if CMD=$(python3 $WRAPPER_INSTALL_DIR/helm_wrap.py $@); then
-  # echo "command: $CMD"
-  exec $CMD
+if [ $? -eq 0 ]; then
+  #echo "Executing: $MODIFIED_CMD"
+  
+  # Execute the correct Helm command
+  eval "$MODIFIED_CMD"
 else
-  echo helm command failed to parse
+  echo "Helm command failed to parse"
+  exit 1
 fi
-
